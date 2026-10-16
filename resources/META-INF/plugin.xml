@@ -1,0 +1,31 @@
+<idea-plugin>
+    <id>com.devtool.microservice.loghub</id>
+    <name>Microservice Log &amp; Error Hub (微服务日志报错总控台)</name>
+    <version>1.1.0</version>
+    <vendor url="https://github.com/Mrmabaoguo/microservice-log-hub">Mrmabaoguo</vendor>
+
+    <description><![CDATA[
+    <b>微服务全量日志与报错聚合总控台</b><br/>
+    专为多微服务（Spring Boot）本地联调打造：<br/>
+    <ul>
+      <li><b>全量实时合并日志</b>：所有微服务的 INFO/DEBUG/SQL/WARN/ERROR 按时间流式汇总，自动标注 <code>[服务名]</code>。</li>
+      <li><b>纯报错堆栈提取</b>：自动拦截所有微服务的 Exception / ERROR 堆栈，集中展示，一眼定位是哪个服务报错。</li>
+      <li><b>源码超链接直达</b>：直接复用 IDEA 原生控制台引擎，点击报错堆栈中的 <code>(Xxx.java:行号)</code> 直接跳转源码。</li>
+      <li><b>按服务/关键字实时过滤</b>：支持按服务名、日志级别、关键字筛选。</li>
+      <li><b>一键强杀残留孤儿服务</b>：内置一键清理后台残留 Java 与编译进程功能，彻底告别端口占用。</li>
+    </ul>
+    ]]></description>
+
+    <idea-version since-build="223.0"/>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="微服务总控台"
+                    anchor="bottom"
+                    icon="AllIcons.Debugger.Console"
+                    secondary="false"
+                    factoryClass="com.devtool.plugin.loghub.MicroserviceLogToolWindowFactory"/>
+    </extensions>
+</idea-plugin>
