@@ -2,6 +2,8 @@ package com.devtool.plugin.loghub;
 
 import com.intellij.execution.ExecutionListener;
 import com.intellij.execution.ExecutionManager;
+import com.intellij.execution.filters.Filter;
+import com.intellij.execution.filters.HyperlinkInfo;
 import com.intellij.execution.filters.TextConsoleBuilderFactory;
 import com.intellij.execution.process.ProcessEvent;
 import com.intellij.execution.process.ProcessHandler;
@@ -14,10 +16,15 @@ import com.intellij.execution.ui.RunContentDescriptor;
 import com.intellij.execution.ui.RunContentManager;
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.fileEditor.OpenFileDescriptor;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
 import com.intellij.openapi.util.Key;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.psi.search.FilenameIndex;
+import com.intellij.psi.search.GlobalSearchScope;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import javax.swing.*;
 import javax.swing.event.DocumentEvent;
@@ -33,12 +40,19 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MicroserviceLogPanel implements Disposable {
 
     private static final int MAX_BUFFER_LINES = 10000;
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+
+    // 匹配任意 (Xxx.java:52) 或 Xxx.java:52 以及前置包名
+    private static final Pattern FILE_LINE_LINK_PATTERN = Pattern.compile(
+            "(?:([a-zA-Z0-9_$.]+)\\.[a-zA-Z0-9_$<>]+\\()?" +
+            "(([a-zA-Z0-9_$]+)\\.(java|kt|groovy|scala)):(\\d+)"
+    );
 
     // 匹配常见 ERROR / Exception / 堆栈行
     private static final Pattern ERROR_START_PATTERN = Pattern.compile(
@@ -115,6 +129,9 @@ public class MicroserviceLogPanel implements Disposable {
 
         this.allLogsConsole = TextConsoleBuilderFactory.getInstance().createBuilder(project).getConsole();
         this.errorLogsConsole = TextConsoleBuilderFactory.getInstance().createBuilder(project).getConsole();
+        Filter fileLinkFilter = createStackTraceFileFilter(project);
+        this.allLogsConsole.addMessageFilter(fileLinkFilter);
+        this.errorLogsConsole.addMessageFilter(fileLinkFilter);
         Disposer.register(this, this.allLogsConsole);
         Disposer.register(this, this.errorLogsConsole);
 
@@ -589,6 +606,107 @@ public class MicroserviceLogPanel implements Disposable {
                 }
             });
         });
+    }
+
+    private Filter createStackTraceFileFilter(Project project) {
+        return new Filter() {
+            @Override
+            public @Nullable Result applyFilter(@NotNull String line, int entireLength) {
+                Matcher matcher = FILE_LINE_LINK_PATTERN.matcher(line);
+                List<ResultItem> items = null;
+                int lineStartOffset = entireLength - line.length();
+
+                while (matcher.find()) {
+                    final String fqClassName = matcher.group(1); // e.g. reactor.core.publisher.MonoDefer
+                    final String fileName = matcher.group(2);    // e.g. MonoDefer.java
+                    final String simpleName = matcher.group(3);  // e.g. MonoDefer
+                    final String lineStr = matcher.group(5);     // e.g. 52
+
+                    int parsedLine = 1;
+                    try {
+                        parsedLine = Integer.parseInt(lineStr);
+                    } catch (NumberFormatException ignored) {
+                    }
+                    final int targetLine = Math.max(1, parsedLine);
+
+                    int linkStart = lineStartOffset + matcher.start(2);
+                    int linkEnd = lineStartOffset + matcher.end(5);
+
+                    HyperlinkInfo hyperlinkInfo = new HyperlinkInfo() {
+                        @Override
+                        public void navigate(@NotNull Project p) {
+                            navigateToFileAndLine(p, fqClassName, fileName, simpleName, targetLine);
+                        }
+                    };
+
+                    if (items == null) {
+                        items = new ArrayList<>(2);
+                    }
+                    items.add(new ResultItem(linkStart, linkEnd, hyperlinkInfo));
+                }
+
+                if (items == null || items.isEmpty()) {
+                    return null;
+                }
+                return new Result(items);
+            }
+        };
+    }
+
+    private void navigateToFileAndLine(Project project, @Nullable String fqClassName, String fileName, String simpleName, int oneBasedLine) {
+        if (project.isDisposed()) return;
+        GlobalSearchScope allScope = GlobalSearchScope.allScope(project);
+
+        // 1. 先按源码文件名查找 (如 MonoDefer.java 或 UserController.java)
+        Collection<VirtualFile> candidates = findFilesByNameCompat(project, fileName, allScope);
+
+        // 2. 如果第三方依赖没有下载 -sources.jar，退化查找编译后的 .class 文件 (如 MonoDefer.class)，由 IDEA 自动反编译并跳转对应行
+        if (candidates.isEmpty()) {
+            candidates = findFilesByNameCompat(project, simpleName + ".class", allScope);
+        }
+
+        if (candidates.isEmpty()) {
+            return;
+        }
+
+        VirtualFile bestMatch = selectBestMatchingFile(candidates, fqClassName);
+        if (bestMatch != null) {
+            new OpenFileDescriptor(project, bestMatch, Math.max(0, oneBasedLine - 1), 0).navigate(true);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Collection<VirtualFile> findFilesByNameCompat(Project project, String name, GlobalSearchScope scope) {
+        try {
+            return FilenameIndex.getVirtualFilesByName(name, scope);
+        } catch (Throwable ignored) {
+            try {
+                java.lang.reflect.Method m = FilenameIndex.class.getMethod(
+                        "getVirtualFilesByName", Project.class, String.class, GlobalSearchScope.class);
+                return (Collection<VirtualFile>) m.invoke(null, project, name, scope);
+            } catch (Throwable ex) {
+                return Collections.emptyList();
+            }
+        }
+    }
+
+    private @Nullable VirtualFile selectBestMatchingFile(Collection<VirtualFile> files, @Nullable String fqClassName) {
+        if (files.isEmpty()) return null;
+        if (files.size() == 1 || fqClassName == null || fqClassName.isEmpty()) {
+            return files.iterator().next();
+        }
+
+        int lastDot = fqClassName.lastIndexOf('.');
+        String pkgPath = lastDot > 0 ? fqClassName.substring(0, lastDot).replace('.', '/') : "";
+
+        // 优先匹配包路径一致且在项目源码中的文件
+        for (VirtualFile vf : files) {
+            String path = vf.getPath().replace('\\', '/');
+            if (!pkgPath.isEmpty() && path.contains(pkgPath)) {
+                return vf;
+            }
+        }
+        return files.iterator().next();
     }
 
     public JComponent getRootComponent() {
