@@ -284,15 +284,35 @@ public class MicroserviceLogPanel implements Disposable {
                 List<RunContentDescriptor> descriptors = RunContentManager.getInstance(project).getAllDescriptors();
                 for (RunContentDescriptor desc : descriptors) {
                     ProcessHandler handler = desc.getProcessHandler();
-                    if (handler != null && !handler.isProcessTerminated()) {
+                    if (handler != null && !handler.isProcessTerminated() && !handler.isProcessTerminating()) {
                         String name = cleanServiceName(desc.getDisplayName());
                         attachProcessHandler(name, handler);
                     }
                 }
-                updateStatusLabel();
+                pruneDeadHandlersAndSyncServices();
             } catch (Throwable ignored) {
             }
         });
+    }
+
+    private void pruneDeadHandlersAndSyncServices() {
+        Iterator<ProcessHandler> it = attachedHandlers.iterator();
+        while (it.hasNext()) {
+            ProcessHandler h = it.next();
+            if (h == null || h.isProcessTerminated() || h.isProcessTerminating()) {
+                it.remove();
+                streamStates.remove(h);
+            }
+        }
+        knownServices.clear();
+        for (ServiceStreamState s : streamStates.values()) {
+            knownServices.add(s.serviceName);
+        }
+        if (!"全部服务 (All)".equals(selectedService) && !knownServices.contains(selectedService)) {
+            selectedService = "全部服务 (All)";
+        }
+        refreshServiceDropdown();
+        updateStatusLabel();
     }
 
     private String cleanServiceName(String rawName) {
@@ -308,7 +328,7 @@ public class MicroserviceLogPanel implements Disposable {
     }
 
     private void attachProcessHandler(String serviceName, ProcessHandler handler) {
-        if (handler == null || !attachedHandlers.add(handler)) {
+        if (handler == null || handler.isProcessTerminated() || handler.isProcessTerminating() || !attachedHandlers.add(handler)) {
             return;
         }
 
@@ -316,10 +336,7 @@ public class MicroserviceLogPanel implements Disposable {
         streamStates.put(handler, state);
 
         ApplicationManager.getApplication().invokeLater(() -> {
-            if (knownServices.add(serviceName)) {
-                refreshServiceDropdown();
-            }
-            updateStatusLabel();
+            pruneDeadHandlersAndSyncServices();
             allLogsConsole.print(String.format("[%s] [系统挂载] 已成功接入服务日志流: %s\n",
                     LocalTime.now().format(TIME_FMT), serviceName), ConsoleViewContentType.SYSTEM_OUTPUT);
         });
@@ -358,7 +375,7 @@ public class MicroserviceLogPanel implements Disposable {
                 ApplicationManager.getApplication().invokeLater(() -> {
                     allLogsConsole.print(String.format("[%s] [%s] ⏹ 服务已停止 (ExitCode=%d)\n",
                             LocalTime.now().format(TIME_FMT), serviceName, event.getExitCode()), ConsoleViewContentType.SYSTEM_OUTPUT);
-                    updateStatusLabel();
+                    pruneDeadHandlersAndSyncServices();
                 });
             }
         }, this);
@@ -505,8 +522,7 @@ public class MicroserviceLogPanel implements Disposable {
         lastErrorBannerTime = 0L;
         allLogsConsole.clear();
         errorLogsConsole.clear();
-        refreshServiceDropdown();
-        updateStatusLabel();
+        pruneDeadHandlersAndSyncServices();
     }
 
     private void refreshServiceDropdown() {
@@ -570,8 +586,28 @@ public class MicroserviceLogPanel implements Disposable {
     }
 
     private void killBackendJavaProcesses() {
+        // 1. 先同步终止 IDEA 当前挂载的所有存活会话句柄
+        List<String> killedList = Collections.synchronizedList(new ArrayList<>());
+        for (ProcessHandler h : new ArrayList<>(attachedHandlers)) {
+            ServiceStreamState st = streamStates.remove(h);
+            attachedHandlers.remove(h);
+            if (h != null && !h.isProcessTerminated()) {
+                try {
+                    h.destroyProcess();
+                    if (st != null) {
+                        killedList.add(st.serviceName + " (IDEA会话)");
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        knownServices.clear();
+        selectedService = "全部服务 (All)";
+        refreshServiceDropdown();
+        updateStatusLabel();
+
+        // 2. 后台扫描系统级 jps 清理残留孤儿进程
         ApplicationManager.getApplication().executeOnPooledThread(() -> {
-            List<String> killedList = new ArrayList<>();
             try {
                 Process jpsProc = new ProcessBuilder("jps", "-l").redirectErrorStream(true).start();
                 try (BufferedReader reader = new BufferedReader(new InputStreamReader(jpsProc.getInputStream(), StandardCharsets.UTF_8))) {
@@ -596,10 +632,11 @@ public class MicroserviceLogPanel implements Disposable {
             }
 
             ApplicationManager.getApplication().invokeLater(() -> {
+                pruneDeadHandlersAndSyncServices();
                 if (killedList.isEmpty()) {
-                    allLogsConsole.print("[系统清理] 当前后台没有发现残留的后台 Java 服务或编译进程。\n", ConsoleViewContentType.SYSTEM_OUTPUT);
+                    allLogsConsole.print("[系统清理] 当前后台没有发现残留的后台 Java 服务或编译进程，下拉列表已同步清空。\n", ConsoleViewContentType.SYSTEM_OUTPUT);
                 } else {
-                    allLogsConsole.print("[系统清理] 已成功强杀 " + killedList.size() + " 个后台进程:\n", ConsoleViewContentType.SYSTEM_OUTPUT);
+                    allLogsConsole.print("[系统清理] 已成功强杀 " + killedList.size() + " 个后台进程，并已同步清空下拉列表:\n", ConsoleViewContentType.SYSTEM_OUTPUT);
                     for (String item : killedList) {
                         allLogsConsole.print("  ✓ " + item + "\n", ConsoleViewContentType.SYSTEM_OUTPUT);
                     }
