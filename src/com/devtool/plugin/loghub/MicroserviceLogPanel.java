@@ -46,7 +46,11 @@ import java.util.regex.Pattern;
 public class MicroserviceLogPanel implements Disposable {
 
     private static final int MAX_BUFFER_LINES = 10000;
+    private static final int MAX_STACK_CONTINUATION_LINES = 80;
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+
+    // 剥离控制台可能附带的 ANSI 颜色控制字符
+    private static final Pattern ANSI_ESCAPE_PATTERN = Pattern.compile("\u001B\\[[;\\d]*[ -/]*[@-~]");
 
     // 匹配任意 (Xxx.java:52) 或 Xxx.java:52 以及前置包名
     private static final Pattern FILE_LINE_LINK_PATTERN = Pattern.compile(
@@ -54,17 +58,25 @@ public class MicroserviceLogPanel implements Disposable {
             "(([a-zA-Z0-9_$]+)\\.(java|kt|groovy|scala)):(\\d+)"
     );
 
-    // 匹配常见 ERROR / Exception / 堆栈行
-    private static final Pattern ERROR_START_PATTERN = Pattern.compile(
-            "(?i)(\\bERROR\\b|\\bFATAL\\b|\\bException\\b|Exception:|Caused by:|Suppressed:|\\[ERROR\\]|[a-zA-Z0-9_$.]+Exception|[a-zA-Z0-9_$.]+Error)"
+    // 匹配以日期或时间开头的标准日志行（支持 [2026-10-21 09:47:06.595] / 2026-10-21 09:47:06.595 / 09:47:06.595 等）
+    private static final Pattern TIMESTAMP_LINE_START_PATTERN = Pattern.compile(
+            "^\\s*\\[?(?:\\d{4}[-/]\\d{2}[-/]\\d{2}[T\\s]+)?\\d{2}:\\d{2}:\\d{2}(?:[.,]\\d{1,6})?"
     );
+
+    // 严格区分大小写：仅在日志头区域内提取标准日志级别
+    private static final Pattern HEADER_LEVEL_TOKEN_PATTERN = Pattern.compile(
+            "\\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\\b"
+    );
+
+    // 无日志头时的独立异常行匹配（严格区分大小写，且必须以 Exception/Error/Throwable 结尾，避免误伤 GlobalExceptionHandler 或 SQL 字段）
+    private static final Pattern STANDALONE_EXCEPTION_HEAD_PATTERN = Pattern.compile(
+            "^\\s*(?:Caused by:|Suppressed:|Exception in thread\\s+\"[^\"]+\"\\s+|(?:[a-zA-Z_$][a-zA-Z0-9_$]*\\.)+[A-Z][a-zA-Z0-9_$]*(?:Exception|Error|Throwable)(?=:|$|\\s))"
+    );
+
+    // 标准堆栈帧行匹配
     private static final Pattern STACK_LINE_PATTERN = Pattern.compile(
-            "^(\\s+at\\s+[a-zA-Z0-9_$.]+\\(|\\s*\\.\\.\\.\\s*\\d+\\s+more|\\s*Caused by:|\\s*Suppressed:)"
+            "^(\\s+at\\s+[a-zA-Z0-9_$/<>]+\\(|\\s*\\.\\.\\.\\s*\\d+\\s+more\\b|\\s*Caused by:|\\s*Suppressed:)"
     );
-    private static final Pattern NORMAL_LOG_HEAD_PATTERN = Pattern.compile(
-            "^(\\d{4}-\\d{2}-\\d{2}|\\d{2}:\\d{2}:\\d{2}).*\\b(INFO|DEBUG|TRACE|WARN)\\b.*"
-    );
-    private static final Pattern WARN_PATTERN = Pattern.compile("(?i)\\bWARN(ING)?\\b");
 
     private final Project project;
     private final JPanel rootPanel;
@@ -87,25 +99,27 @@ public class MicroserviceLogPanel implements Disposable {
     private final Map<ProcessHandler, ServiceStreamState> streamStates = new ConcurrentHashMap<>();
     private final Deque<LogRecord> logBuffer = new ConcurrentLinkedDeque<>();
     private final AtomicInteger totalErrorBlocks = new AtomicInteger(0);
+    private final AtomicInteger nextErrorBlockId = new AtomicInteger(1);
 
     private volatile String selectedService = "全部服务 (All)";
     private volatile int selectedLevelIndex = 0; // 0=全部级别, 1=WARN+ERROR, 2=仅ERROR
     private volatile String keywordFilter = "";
     private volatile boolean paused = false;
-    private volatile String lastErrorBannerService = "";
-    private volatile long lastErrorBannerTime = 0L;
+    private volatile int lastPrintedErrorBlockId = -1;
 
     private static class LogRecord {
         final String time;
         final String serviceName;
         final String rawLine;
         final Level level;
+        final int errorBlockId;
 
-        LogRecord(String time, String serviceName, String rawLine, Level level) {
+        LogRecord(String time, String serviceName, String rawLine, Level level, int errorBlockId) {
             this.time = time;
             this.serviceName = serviceName;
             this.rawLine = rawLine;
             this.level = level;
+            this.errorBlockId = errorBlockId;
         }
     }
 
@@ -117,6 +131,7 @@ public class MicroserviceLogPanel implements Disposable {
         final String serviceName;
         final StringBuilder lineBuffer = new StringBuilder();
         int remainingErrorLines = 0;
+        int currentErrorBlockId = 0;
 
         ServiceStreamState(String serviceName) {
             this.serviceName = serviceName;
@@ -348,7 +363,6 @@ public class MicroserviceLogPanel implements Disposable {
                 String text = event.getText();
                 if (text == null || text.isEmpty()) return;
 
-                boolean isStdErr = ProcessOutputTypes.STDERR.equals(outputType);
                 boolean isSystem = ProcessOutputTypes.SYSTEM.equals(outputType);
                 if (isSystem) {
                     return; // 忽略冗长启动命令行参数本身
@@ -363,7 +377,7 @@ public class MicroserviceLogPanel implements Disposable {
                             line = line.substring(0, line.length() - 1);
                         }
                         state.lineBuffer.delete(0, newlineIdx + 1);
-                        processSingleLine(state, line, isStdErr);
+                        processSingleLine(state, line);
                     }
                 }
             }
@@ -381,68 +395,146 @@ public class MicroserviceLogPanel implements Disposable {
         }, this);
     }
 
-    private void processSingleLine(ServiceStreamState state, String line, boolean isStdErr) {
+    private void processSingleLine(ServiceStreamState state, String line) {
         if (line.trim().isEmpty()) {
             return;
         }
 
         String serviceName = state.serviceName;
-        Level level = classifyLine(state, line, isStdErr);
-        String now = LocalTime.now().format(TIME_FMT);
+        int prevErrorBlockId = state.currentErrorBlockId;
+        Level level = classifyLine(state, line);
+        int blockId = (level == Level.ERROR) ? state.currentErrorBlockId : 0;
+        boolean isNewErrorBlock = (level == Level.ERROR && blockId != prevErrorBlockId);
 
-        LogRecord record = new LogRecord(now, serviceName, line, level);
+        if (isNewErrorBlock) {
+            serviceErrorCounts.merge(serviceName, 1, Integer::sum);
+            totalErrorBlocks.incrementAndGet();
+        }
+
+        String now = LocalTime.now().format(TIME_FMT);
+        LogRecord record = new LogRecord(now, serviceName, line, level, blockId);
         logBuffer.addLast(record);
         while (logBuffer.size() > MAX_BUFFER_LINES) {
             logBuffer.pollFirst();
         }
 
-        if (level == Level.ERROR) {
-            if (ERROR_START_PATTERN.matcher(line).find() && !STACK_LINE_PATTERN.matcher(line).find()) {
-                serviceErrorCounts.merge(serviceName, 1, Integer::sum);
-                totalErrorBlocks.incrementAndGet();
-            }
-        }
-
         ApplicationManager.getApplication().invokeLater(() -> {
             if (project.isDisposed()) return;
+            if (isNewErrorBlock) {
+                refreshServiceDropdown();
+                updateStatusLabel();
+            }
             if (matchesFilter(record)) {
                 printRecordToAllConsole(record);
             }
-            if (record.level == Level.ERROR && matchesServiceAndKeyword(record)) {
-                printRecordToErrorConsole(record);
-                updateStatusLabel();
+            if (record.level == Level.ERROR) {
+                if (keywordFilter.isEmpty()) {
+                    if (matchesService(record)) {
+                        printRecordToErrorConsole(record);
+                    }
+                } else {
+                    // 当存在搜索关键字时，若当前行或同属该报错块的其他行匹配，重绘以保证整块堆栈完整展示
+                    if (matchesServiceAndKeyword(record) || isErrorBlockMatchingKeyword(record.errorBlockId)) {
+                        rebuildErrorConsoleOnly();
+                    }
+                }
             }
         });
     }
 
-    private Level classifyLine(ServiceStreamState state, String line, boolean isStdErr) {
-        if (NORMAL_LOG_HEAD_PATTERN.matcher(line).matches()) {
-            state.remainingErrorLines = 0;
-            if (WARN_PATTERN.matcher(line).find()) {
-                return Level.WARN;
+    private Level classifyLine(ServiceStreamState state, String rawLine) {
+        String cleanLine = stripAnsi(rawLine);
+
+        // 1. 优先识别以日期/时间开头的标准日志头，严格只从日志头区域提取级别，绝不扫描业务正文或 SQL
+        if (TIMESTAMP_LINE_START_PATTERN.matcher(cleanLine).find()) {
+            String headerRegion = extractLogHeaderRegion(cleanLine);
+            Matcher levelMatcher = HEADER_LEVEL_TOKEN_PATTERN.matcher(headerRegion);
+            if (levelMatcher.find()) {
+                String lvl = levelMatcher.group(1);
+                if ("ERROR".equals(lvl) || "FATAL".equals(lvl)) {
+                    startOrContinueErrorBlock(state);
+                    return Level.ERROR;
+                } else if ("WARN".equals(lvl) || "WARNING".equals(lvl)) {
+                    endErrorBlock(state);
+                    return Level.WARN;
+                } else {
+                    // INFO / DEBUG / TRACE 强制清空报错状态，绝不被前序报错连坐
+                    endErrorBlock(state);
+                    return Level.INFO;
+                }
             }
+            // 带时间戳但未匹配到 ERROR/WARN 的普通日志行，同样结束前序报错块
+            endErrorBlock(state);
             return Level.INFO;
         }
 
-        if (isStdErr || ERROR_START_PATTERN.matcher(line).find()) {
-            state.remainingErrorLines = 60;
+        // 2. 无时间戳行：检查是否为标准 Java 异常头（如 java.lang.NullPointerException: ... / Caused by: ...）
+        if (STANDALONE_EXCEPTION_HEAD_PATTERN.matcher(cleanLine).find()) {
+            startOrContinueErrorBlock(state);
             return Level.ERROR;
         }
 
+        // 3. 无时间戳行：检查是否为异常堆栈帧（\tat pkg.Class.method(File.java:52) / ... N more）
+        if (STACK_LINE_PATTERN.matcher(cleanLine).find()) {
+            if (state.currentErrorBlockId == 0) {
+                startOrContinueErrorBlock(state);
+            } else {
+                state.remainingErrorLines = MAX_STACK_CONTINUATION_LINES;
+            }
+            return Level.ERROR;
+        }
+
+        // 4. 如果当前正处于报错块中，允许紧接在 ERROR 日志头后面的多行异常描述延续（但排除 MyBatis ==> / <== 等调试行）
         if (state.remainingErrorLines > 0) {
+            String trimmed = cleanLine.trim();
+            if (trimmed.startsWith("==>") || trimmed.startsWith("<==")) {
+                endErrorBlock(state);
+                return Level.INFO;
+            }
             state.remainingErrorLines--;
+            if (state.remainingErrorLines == 0) {
+                state.currentErrorBlockId = 0;
+            }
             return Level.ERROR;
-        }
-
-        if (WARN_PATTERN.matcher(line).find()) {
-            return Level.WARN;
         }
 
         return Level.INFO;
     }
 
+    private void startOrContinueErrorBlock(ServiceStreamState state) {
+        if (state.currentErrorBlockId == 0) {
+            state.currentErrorBlockId = nextErrorBlockId.getAndIncrement();
+        }
+        state.remainingErrorLines = MAX_STACK_CONTINUATION_LINES;
+    }
+
+    private void endErrorBlock(ServiceStreamState state) {
+        state.remainingErrorLines = 0;
+        state.currentErrorBlockId = 0;
+    }
+
+    private String stripAnsi(String input) {
+        if (input.indexOf('\u001B') < 0) {
+            return input;
+        }
+        return ANSI_ESCAPE_PATTERN.matcher(input).replaceAll("");
+    }
+
+    private String extractLogHeaderRegion(String cleanLine) {
+        int dashIdx = cleanLine.indexOf(" - ");
+        int limit = Math.min(cleanLine.length(), 110);
+        if (dashIdx > 0 && dashIdx < limit) {
+            limit = dashIdx;
+        }
+        return cleanLine.substring(0, limit);
+    }
+
+    private boolean matchesService(LogRecord rec) {
+        return "全部服务 (All)".equals(selectedService) || selectedService.equals(rec.serviceName);
+    }
+
     private boolean matchesServiceAndKeyword(LogRecord rec) {
-        if (!"全部服务 (All)".equals(selectedService) && !selectedService.equals(rec.serviceName)) {
+        if (!matchesService(rec)) {
             return false;
         }
         String kw = keywordFilter;
@@ -452,6 +544,22 @@ public class MicroserviceLogPanel implements Disposable {
                     || rec.serviceName.toLowerCase(Locale.ROOT).contains(lowerKw);
         }
         return true;
+    }
+
+    private boolean isErrorBlockMatchingKeyword(int blockId) {
+        if (blockId <= 0 || keywordFilter.isEmpty()) {
+            return false;
+        }
+        String lowerKw = keywordFilter.toLowerCase(Locale.ROOT);
+        for (LogRecord rec : logBuffer) {
+            if (rec.errorBlockId == blockId && matchesService(rec)) {
+                if (rec.rawLine.toLowerCase(Locale.ROOT).contains(lowerKw)
+                        || rec.serviceName.toLowerCase(Locale.ROOT).contains(lowerKw)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private boolean matchesFilter(LogRecord rec) {
@@ -482,10 +590,8 @@ public class MicroserviceLogPanel implements Disposable {
     }
 
     private void printRecordToErrorConsole(LogRecord rec) {
-        long nowMs = System.currentTimeMillis();
-        if (!rec.serviceName.equals(lastErrorBannerService) || (nowMs - lastErrorBannerTime) > 2500L) {
-            lastErrorBannerService = rec.serviceName;
-            lastErrorBannerTime = nowMs;
+        if (rec.errorBlockId != lastPrintedErrorBlockId) {
+            lastPrintedErrorBlockId = rec.errorBlockId;
             errorLogsConsole.print(String.format(
                     "\n==================== 🔥 [%s] 报错服务: 【%s】 ====================\n",
                     rec.time, rec.serviceName), ConsoleViewContentType.SYSTEM_OUTPUT);
@@ -498,28 +604,51 @@ public class MicroserviceLogPanel implements Disposable {
         rebuildConsolesFromBuffer();
     }
 
+    private void rebuildErrorConsoleOnly() {
+        errorLogsConsole.clear();
+        lastPrintedErrorBlockId = -1;
+
+        Set<Integer> matchedBlocks = null;
+        if (!keywordFilter.isEmpty()) {
+            matchedBlocks = new HashSet<>();
+            String lowerKw = keywordFilter.toLowerCase(Locale.ROOT);
+            for (LogRecord rec : logBuffer) {
+                if (rec.level == Level.ERROR && matchesService(rec)) {
+                    if (rec.rawLine.toLowerCase(Locale.ROOT).contains(lowerKw)
+                            || rec.serviceName.toLowerCase(Locale.ROOT).contains(lowerKw)) {
+                        matchedBlocks.add(rec.errorBlockId);
+                    }
+                }
+            }
+        }
+
+        for (LogRecord rec : logBuffer) {
+            if (rec.level == Level.ERROR && matchesService(rec)) {
+                if (matchedBlocks == null || matchedBlocks.contains(rec.errorBlockId)) {
+                    printRecordToErrorConsole(rec);
+                }
+            }
+        }
+    }
+
     private void rebuildConsolesFromBuffer() {
         allLogsConsole.clear();
-        errorLogsConsole.clear();
-        lastErrorBannerService = "";
-        lastErrorBannerTime = 0L;
-
         for (LogRecord rec : logBuffer) {
             if (matchesFilter(rec)) {
                 printRecordToAllConsole(rec);
             }
-            if (rec.level == Level.ERROR && matchesServiceAndKeyword(rec)) {
-                printRecordToErrorConsole(rec);
-            }
         }
+        rebuildErrorConsoleOnly();
     }
 
     private void clearAllLogs() {
         logBuffer.clear();
         serviceErrorCounts.clear();
         totalErrorBlocks.set(0);
-        lastErrorBannerService = "";
-        lastErrorBannerTime = 0L;
+        lastPrintedErrorBlockId = -1;
+        for (ServiceStreamState st : streamStates.values()) {
+            endErrorBlock(st);
+        }
         allLogsConsole.clear();
         errorLogsConsole.clear();
         pruneDeadHandlersAndSyncServices();
@@ -654,10 +783,10 @@ public class MicroserviceLogPanel implements Disposable {
                 int lineStartOffset = entireLength - line.length();
 
                 while (matcher.find()) {
-                    final String fqClassName = matcher.group(1); // e.g. reactor.core.publisher.MonoDefer
-                    final String fileName = matcher.group(2);    // e.g. MonoDefer.java
-                    final String simpleName = matcher.group(3);  // e.g. MonoDefer
-                    final String lineStr = matcher.group(5);     // e.g. 52
+                    final String fqClassName = matcher.group(1);
+                    final String fileName = matcher.group(2);
+                    final String simpleName = matcher.group(3);
+                    final String lineStr = matcher.group(5);
 
                     int parsedLine = 1;
                     try {
@@ -694,10 +823,7 @@ public class MicroserviceLogPanel implements Disposable {
         if (project.isDisposed()) return;
         GlobalSearchScope allScope = GlobalSearchScope.allScope(project);
 
-        // 1. 先按源码文件名查找 (如 MonoDefer.java 或 UserController.java)
         Collection<VirtualFile> candidates = findFilesByNameCompat(project, fileName, allScope);
-
-        // 2. 如果第三方依赖没有下载 -sources.jar，退化查找编译后的 .class 文件 (如 MonoDefer.class)，由 IDEA 自动反编译并跳转对应行
         if (candidates.isEmpty()) {
             candidates = findFilesByNameCompat(project, simpleName + ".class", allScope);
         }
@@ -736,7 +862,6 @@ public class MicroserviceLogPanel implements Disposable {
         int lastDot = fqClassName.lastIndexOf('.');
         String pkgPath = lastDot > 0 ? fqClassName.substring(0, lastDot).replace('.', '/') : "";
 
-        // 优先匹配包路径一致且在项目源码中的文件
         for (VirtualFile vf : files) {
             String path = vf.getPath().replace('\\', '/');
             if (!pkgPath.isEmpty() && path.contains(pkgPath)) {
