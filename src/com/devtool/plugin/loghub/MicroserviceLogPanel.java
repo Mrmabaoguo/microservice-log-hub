@@ -4,7 +4,7 @@ import com.intellij.execution.ExecutionListener;
 import com.intellij.execution.ExecutionManager;
 import com.intellij.execution.filters.Filter;
 import com.intellij.execution.filters.HyperlinkInfo;
-import com.intellij.execution.filters.TextConsoleBuilderFactory;
+import com.intellij.execution.impl.ConsoleViewImpl;
 import com.intellij.execution.process.ProcessEvent;
 import com.intellij.execution.process.ProcessHandler;
 import com.intellij.execution.process.ProcessListener;
@@ -46,7 +46,6 @@ import java.util.regex.Pattern;
 public class MicroserviceLogPanel implements Disposable {
 
     private static final int MAX_BUFFER_LINES = 10000;
-    private static final int MAX_STACK_CONTINUATION_LINES = 80;
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
     // 剥离控制台可能附带的 ANSI 颜色控制字符
@@ -68,6 +67,11 @@ public class MicroserviceLogPanel implements Disposable {
             "\\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\\b"
     );
 
+    // 无时间戳但以显式 [INFO]/[ERROR] 等标签开头的日志行
+    private static final Pattern EXPLICIT_PREFIX_LEVEL_PATTERN = Pattern.compile(
+            "^\\s*\\[(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\\]"
+    );
+
     // 无日志头时的独立异常行匹配（严格区分大小写，且必须以 Exception/Error/Throwable 结尾，避免误伤 GlobalExceptionHandler 或 SQL 字段）
     private static final Pattern STANDALONE_EXCEPTION_HEAD_PATTERN = Pattern.compile(
             "^\\s*(?:Caused by:|Suppressed:|Exception in thread\\s+\"[^\"]+\"\\s+|(?:[a-zA-Z_$][a-zA-Z0-9_$]*\\.)+[A-Z][a-zA-Z0-9_$]*(?:Exception|Error|Throwable)(?=:|$|\\s))"
@@ -75,7 +79,17 @@ public class MicroserviceLogPanel implements Disposable {
 
     // 标准堆栈帧行匹配
     private static final Pattern STACK_LINE_PATTERN = Pattern.compile(
-            "^(\\s+at\\s+[a-zA-Z0-9_$/<>]+\\(|\\s*\\.\\.\\.\\s*\\d+\\s+more\\b|\\s*Caused by:|\\s*Suppressed:)"
+            "^(\\s+at\\s+[a-zA-Z0-9_$.<>/-]+\\(|\\s*\\.\\.\\.\\s*\\d+\\s+(?:more|common frames omitted)\\b|\\s*Caused by:|\\s*Suppressed:)"
+    );
+
+    // MyBatis 结构化错误诊断行匹配（如 ### Error querying database / ### The error may exist in / ### SQL: / ### Cause:）
+    private static final Pattern MYBATIS_ERROR_DETAIL_PATTERN = Pattern.compile(
+            "^\\s*###\\s+(?:Error\\b|The error\\b|SQL:|Cause:)"
+    );
+
+    // 检查当前 I/O 缓冲剩余文本中是否紧跟标准堆栈帧（用于精准识别被包夹在 Exception 头与 \tat 之间的多行 getMessage()）
+    private static final Pattern BUFFER_UPCOMING_STACK_PATTERN = Pattern.compile(
+            "(?:^|\\n)\\s*(?:at\\s+[a-zA-Z0-9_$.<>/-]+\\(|Caused by:|Suppressed:|\\.\\.\\.\\s*\\d+\\s+(?:more|common frames omitted)\\b)"
     );
 
     private final Project project;
@@ -106,6 +120,7 @@ public class MicroserviceLogPanel implements Disposable {
     private volatile String keywordFilter = "";
     private volatile boolean paused = false;
     private volatile int lastPrintedErrorBlockId = -1;
+    private volatile boolean internalClearing = false;
 
     private static class LogRecord {
         final String time;
@@ -130,8 +145,9 @@ public class MicroserviceLogPanel implements Disposable {
     private static class ServiceStreamState {
         final String serviceName;
         final StringBuilder lineBuffer = new StringBuilder();
-        int remainingErrorLines = 0;
         int currentErrorBlockId = 0;
+        boolean inStackFrames = false;
+        long lastErrorTimeMs = 0L;
 
         ServiceStreamState(String serviceName) {
             this.serviceName = serviceName;
@@ -142,8 +158,8 @@ public class MicroserviceLogPanel implements Disposable {
         this.project = project;
         Disposer.register(parentDisposable, this);
 
-        this.allLogsConsole = TextConsoleBuilderFactory.getInstance().createBuilder(project).getConsole();
-        this.errorLogsConsole = TextConsoleBuilderFactory.getInstance().createBuilder(project).getConsole();
+        this.allLogsConsole = createHookedConsole(project);
+        this.errorLogsConsole = createHookedConsole(project);
         Filter fileLinkFilter = createStackTraceFileFilter(project);
         this.allLogsConsole.addMessageFilter(fileLinkFilter);
         this.errorLogsConsole.addMessageFilter(fileLinkFilter);
@@ -192,7 +208,7 @@ public class MicroserviceLogPanel implements Disposable {
         });
         topBar.add(keywordField);
 
-        splitViewCheck = new JCheckBox("左右分屏同看(全量+报错)", true);
+        splitViewCheck = new JCheckBox("左右分屏同看(全量+报错)", false);
         splitViewCheck.addActionListener(e -> updateLayoutMode());
         topBar.add(splitViewCheck);
 
@@ -444,6 +460,7 @@ public class MicroserviceLogPanel implements Disposable {
 
     private Level classifyLine(ServiceStreamState state, String rawLine) {
         String cleanLine = stripAnsi(rawLine);
+        long nowMs = System.currentTimeMillis();
 
         // 1. 优先识别以日期/时间开头的标准日志头，严格只从日志头区域提取级别，绝不扫描业务正文或 SQL
         if (TIMESTAMP_LINE_START_PATTERN.matcher(cleanLine).find()) {
@@ -452,7 +469,11 @@ public class MicroserviceLogPanel implements Disposable {
             if (levelMatcher.find()) {
                 String lvl = levelMatcher.group(1);
                 if ("ERROR".equals(lvl) || "FATAL".equals(lvl)) {
-                    startOrContinueErrorBlock(state);
+                    if (state.currentErrorBlockId == 0 || (nowMs - state.lastErrorTimeMs) > 200L) {
+                        state.currentErrorBlockId = nextErrorBlockId.getAndIncrement();
+                    }
+                    state.inStackFrames = false;
+                    state.lastErrorTimeMs = nowMs;
                     return Level.ERROR;
                 } else if ("WARN".equals(lvl) || "WARNING".equals(lvl)) {
                     endErrorBlock(state);
@@ -468,49 +489,78 @@ public class MicroserviceLogPanel implements Disposable {
             return Level.INFO;
         }
 
+        // 1b. 无时间戳但以显式 [INFO]/[ERROR] 等标签开头的日志行
+        Matcher prefixLevelMatcher = EXPLICIT_PREFIX_LEVEL_PATTERN.matcher(cleanLine);
+        if (prefixLevelMatcher.find()) {
+            String lvl = prefixLevelMatcher.group(1);
+            if ("ERROR".equals(lvl) || "FATAL".equals(lvl)) {
+                if (state.currentErrorBlockId == 0 || (nowMs - state.lastErrorTimeMs) > 200L) {
+                    state.currentErrorBlockId = nextErrorBlockId.getAndIncrement();
+                }
+                state.inStackFrames = false;
+                state.lastErrorTimeMs = nowMs;
+                return Level.ERROR;
+            } else if ("WARN".equals(lvl) || "WARNING".equals(lvl)) {
+                endErrorBlock(state);
+                return Level.WARN;
+            } else {
+                endErrorBlock(state);
+                return Level.INFO;
+            }
+        }
+
         // 2. 无时间戳行：检查是否为标准 Java 异常头（如 java.lang.NullPointerException: ... / Caused by: ...）
         if (STANDALONE_EXCEPTION_HEAD_PATTERN.matcher(cleanLine).find()) {
-            startOrContinueErrorBlock(state);
+            if (state.currentErrorBlockId == 0 || (nowMs - state.lastErrorTimeMs) > 500L) {
+                state.currentErrorBlockId = nextErrorBlockId.getAndIncrement();
+            }
+            state.inStackFrames = false;
+            state.lastErrorTimeMs = nowMs;
             return Level.ERROR;
         }
 
         // 3. 无时间戳行：检查是否为异常堆栈帧（\tat pkg.Class.method(File.java:52) / ... N more）
         if (STACK_LINE_PATTERN.matcher(cleanLine).find()) {
-            if (state.currentErrorBlockId == 0) {
-                startOrContinueErrorBlock(state);
-            } else {
-                state.remainingErrorLines = MAX_STACK_CONTINUATION_LINES;
+            if (state.currentErrorBlockId == 0 || (nowMs - state.lastErrorTimeMs) > 500L) {
+                state.currentErrorBlockId = nextErrorBlockId.getAndIncrement();
             }
+            state.inStackFrames = true;
+            state.lastErrorTimeMs = nowMs;
             return Level.ERROR;
         }
 
-        // 4. 如果当前正处于报错块中，允许紧接在 ERROR 日志头后面的多行异常描述延续（但排除 MyBatis ==> / <== 等调试行）
-        if (state.remainingErrorLines > 0) {
-            String trimmed = cleanLine.trim();
-            if (trimmed.startsWith("==>") || trimmed.startsWith("<==")) {
-                endErrorBlock(state);
-                return Level.INFO;
+        // 4. 处于活跃报错块时，仅允许结构化错误详情（MyBatis ###）或同批次缓冲中被 \tat 堆栈行包夹的多行异常描述延续
+        if (state.currentErrorBlockId != 0) {
+            if (MYBATIS_ERROR_DETAIL_PATTERN.matcher(cleanLine).find()) {
+                state.lastErrorTimeMs = nowMs;
+                return Level.ERROR;
             }
-            state.remainingErrorLines--;
-            if (state.remainingErrorLines == 0) {
-                state.currentErrorBlockId = 0;
+            if (!state.inStackFrames
+                    && (nowMs - state.lastErrorTimeMs) <= 50L
+                    && hasUpcomingStackLine(state.lineBuffer)) {
+                state.lastErrorTimeMs = nowMs;
+                return Level.ERROR;
             }
-            return Level.ERROR;
+            // 其他任何无时间戳普通输出（如 System.out.println("保存登录日志") / "+++++++++定时远程放料未启动"）立即关闭报错块
+            endErrorBlock(state);
         }
 
         return Level.INFO;
     }
 
-    private void startOrContinueErrorBlock(ServiceStreamState state) {
-        if (state.currentErrorBlockId == 0) {
-            state.currentErrorBlockId = nextErrorBlockId.getAndIncrement();
+    private boolean hasUpcomingStackLine(StringBuilder lineBuffer) {
+        if (lineBuffer.length() == 0) {
+            return false;
         }
-        state.remainingErrorLines = MAX_STACK_CONTINUATION_LINES;
+        int scanLen = Math.min(lineBuffer.length(), 4096);
+        String preview = lineBuffer.substring(0, scanLen);
+        return BUFFER_UPCOMING_STACK_PATTERN.matcher(preview).find();
     }
 
     private void endErrorBlock(ServiceStreamState state) {
-        state.remainingErrorLines = 0;
         state.currentErrorBlockId = 0;
+        state.inStackFrames = false;
+        state.lastErrorTimeMs = 0L;
     }
 
     private String stripAnsi(String input) {
@@ -604,8 +654,25 @@ public class MicroserviceLogPanel implements Disposable {
         rebuildConsolesFromBuffer();
     }
 
+    private ConsoleView createHookedConsole(@NotNull Project project) {
+        return new ConsoleViewImpl(project, GlobalSearchScope.allScope(project), false, true) {
+            @Override
+            public void clear() {
+                super.clear();
+                if (!internalClearing) {
+                    clearAllLogs();
+                }
+            }
+        };
+    }
+
     private void rebuildErrorConsoleOnly() {
-        errorLogsConsole.clear();
+        internalClearing = true;
+        try {
+            errorLogsConsole.clear();
+        } finally {
+            internalClearing = false;
+        }
         lastPrintedErrorBlockId = -1;
 
         Set<Integer> matchedBlocks = null;
@@ -632,7 +699,12 @@ public class MicroserviceLogPanel implements Disposable {
     }
 
     private void rebuildConsolesFromBuffer() {
-        allLogsConsole.clear();
+        internalClearing = true;
+        try {
+            allLogsConsole.clear();
+        } finally {
+            internalClearing = false;
+        }
         for (LogRecord rec : logBuffer) {
             if (matchesFilter(rec)) {
                 printRecordToAllConsole(rec);
@@ -649,8 +721,13 @@ public class MicroserviceLogPanel implements Disposable {
         for (ServiceStreamState st : streamStates.values()) {
             endErrorBlock(st);
         }
-        allLogsConsole.clear();
-        errorLogsConsole.clear();
+        internalClearing = true;
+        try {
+            allLogsConsole.clear();
+            errorLogsConsole.clear();
+        } finally {
+            internalClearing = false;
+        }
         pruneDeadHandlersAndSyncServices();
     }
 
